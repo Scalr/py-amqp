@@ -138,7 +138,12 @@ class _AbstractTransport(object):
 
     def close(self):
         if self.sock is not None:
-            self._shutdown_transport()
+            # This call fails for us, probably when Rabbitmq is already down
+            # before it happens. [FAM-202]
+            try:
+                self._shutdown_transport()
+            except ValueError:
+                pass
             # Call shutdown first to make sure that pending messages
             # reach the AMQP broker if the program exits after
             # calling this method.
