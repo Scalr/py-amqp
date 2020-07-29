@@ -4,11 +4,12 @@ import socket
 import warnings
 
 import pytest
-from case import ContextMock, Mock, call
+from case import ContextMock, Mock, call, patch
 
 from amqp import Connection, spec
 from amqp.connection import SSLError
-from amqp.exceptions import ConnectionError, NotFound, ResourceError
+from amqp.exceptions import (ConnectionError, NotFound,
+                             RecoverableConnectionError, ResourceError)
 from amqp.five import items
 from amqp.sasl import AMQPLAIN, EXTERNAL, GSSAPI, PLAIN, SASL
 from amqp.transport import TCPTransport
@@ -100,6 +101,33 @@ class test_Connection:
             self.conn.connect.assert_called_with()
         self.conn.close.assert_called_with()
 
+    def test__enter__socket_error(self):
+        # test when entering
+        self.conn = Connection()
+        self.conn.close = Mock(name='close')
+        reached = False
+        with patch('socket.socket', side_effect=socket.error):
+            with pytest.raises(socket.error):
+                with self.conn:
+                    reached = True
+        assert not reached and not self.conn.close.called
+        assert self.conn._transport is None and not self.conn.connected
+
+    def test__exit__socket_error(self):
+        # test when exiting
+        connection = self.conn
+        transport = connection._transport
+        transport.connected = True
+        connection.send_method = Mock(name='send_method',
+                                      side_effect=socket.error)
+        reached = False
+        with pytest.raises(socket.error):
+            with connection:
+                reached = True
+        assert reached
+        assert connection.send_method.called and transport.close.called
+        assert self.conn._transport is None and not self.conn.connected
+
     def test_then(self):
         self.conn.on_open = Mock(name='on_open')
         on_success = Mock(name='on_success')
@@ -126,6 +154,20 @@ class test_Connection:
         self.conn.transport.connected = True
         assert self.conn.connect(callback) == callback.return_value
         callback.assert_called_with()
+
+    def test_connect__socket_error(self):
+        # check Transport.Connect error
+        # socket.error derives from IOError
+        # ssl.SSLError derives from socket.error
+        self.conn = Connection()
+        self.conn.Transport = Mock(name='Transport')
+        transport = self.conn.Transport.return_value
+        transport.connect.side_effect = IOError
+        assert self.conn._transport is None and not self.conn.connected
+        with pytest.raises(IOError):
+            self.conn.connect()
+        transport.connect.assert_called
+        assert self.conn._transport is None and not self.conn.connected
 
     def test_on_start(self):
         self.conn._on_start(3, 4, {'foo': 'bar'}, b'x y z AMQPLAIN PLAIN',
@@ -279,6 +321,7 @@ class test_Connection:
         for i, channel in items(channels):
             if i:
                 channel.collect.assert_called_with()
+        assert self.conn._transport is None
 
     def test_collect__channel_raises_socket_error(self):
         self.conn.channels = self.conn.channels = {1: Mock(name='c1')}
@@ -313,6 +356,12 @@ class test_Connection:
         self.conn.Channel.assert_called_with(self.conn, 3, on_open=callback)
         c2 = self.conn.channel(3, callback)
         assert c2 is c
+
+    def test_channel_when_connection_is_closed(self):
+        self.conn.collect()
+        callback = Mock(name='callback')
+        with pytest.raises(RecoverableConnectionError):
+            self.conn.channel(3, callback)
 
     def test_is_alive(self):
         with pytest.raises(NotImplementedError):
@@ -375,7 +424,13 @@ class test_Connection:
             (50, 60), 'payload', 'content',
         )
 
+    def test_on_inbound_method_when_connection_is_closed(self):
+        self.conn.collect()
+        with pytest.raises(RecoverableConnectionError):
+            self.conn.on_inbound_method(1, (50, 60), 'payload', 'content')
+
     def test_close(self):
+        self.conn.collect = Mock(name='collect')
         self.conn.close(reply_text='foo', method_sig=spec.Channel.Open)
         self.conn.send_method.assert_called_with(
             spec.Connection.Close, 'BsBB',
@@ -386,6 +441,14 @@ class test_Connection:
     def test_close__already_closed(self):
         self.conn.transport = None
         self.conn.close()
+
+    def test_close__socket_error(self):
+        self.conn.send_method = Mock(name='send_method',
+                                     side_effect=socket.error)
+        with pytest.raises(socket.error):
+            self.conn.close()
+        self.conn.send_method.assert_called()
+        assert self.conn._transport is None and not self.conn.connected
 
     def test_on_close(self):
         self.conn._x_close_ok = Mock(name='_x_close_ok')

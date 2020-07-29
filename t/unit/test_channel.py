@@ -1,18 +1,26 @@
 from __future__ import absolute_import, unicode_literals
 
+import socket
+
 import pytest
-from case import ContextMock, Mock, patch
+from vine import promise
 
 from amqp import spec
+from amqp.basic_message import Message
 from amqp.channel import Channel
-from amqp.exceptions import ConsumerCancelled, NotFound
+from amqp.exceptions import (ConsumerCancelled, MessageNacked, NotFound,
+                             RecoverableConnectionError)
+from amqp.platform import pack
+from amqp.serialization import dumps
+from case import ANY, ContextMock, MagicMock, Mock, patch
 
 
 class test_Channel:
 
     @pytest.fixture(autouse=True)
     def setup_conn(self):
-        self.conn = Mock(name='connection')
+        self.conn = MagicMock(name='connection')
+        self.conn.is_closing = False
         self.conn.channels = {}
         self.conn._get_free_channel_id.return_value = 2
         self.c = Channel(self.conn, 1)
@@ -80,6 +88,7 @@ class test_Channel:
             (30, 'text', spec.Queue.Declare[0], spec.Queue.Declare[1]),
             wait=spec.Channel.CloseOk,
         )
+        assert self.c.is_closing is False
         assert self.c.connection is None
 
     def test_on_close(self):
@@ -139,12 +148,10 @@ class test_Channel:
         )
 
     def test_exchange_declare__auto_delete(self):
-        with patch('amqp.channel.warn') as warn:
-            self.c.exchange_declare(
-                'foo', 'direct', False, True,
-                auto_delete=True, nowait=False, arguments={'x': 1},
-            )
-            warn.assert_called()
+        self.c.exchange_declare(
+            'foo', 'direct', False, True,
+            auto_delete=True, nowait=False, arguments={'x': 1},
+        )
 
     def test_exchange_delete(self):
         self.c.exchange_delete('foo')
@@ -262,6 +269,7 @@ class test_Channel:
     def test_basic_consume(self):
         callback = Mock()
         on_cancel = Mock()
+        self.c.send_method.return_value = (123, )
         self.c.basic_consume(
             'q', 123, arguments={'x': 1},
             callback=callback,
@@ -271,22 +279,75 @@ class test_Channel:
             spec.Basic.Consume, 'BssbbbbF',
             (0, 'q', 123, False, False, False, False, {'x': 1}),
             wait=spec.Basic.ConsumeOk,
+            returns_tuple=True
         )
         assert self.c.callbacks[123] is callback
         assert self.c.cancel_callbacks[123] is on_cancel
 
     def test_basic_consume__no_ack(self):
+        self.c.send_method.return_value = (123,)
         self.c.basic_consume(
             'q', 123, arguments={'x': 1}, no_ack=True,
         )
         assert 123 in self.c.no_ack_consumers
 
+    def test_basic_consume_no_consumer_tag(self):
+        callback = Mock()
+        self.c.send_method.return_value = (123,)
+        ret = self.c.basic_consume(
+            'q', arguments={'x': 1},
+            callback=callback,
+        )
+        self.c.send_method.assert_called_with(
+            spec.Basic.Consume, 'BssbbbbF',
+            (0, 'q', '', False, False, False, False, {'x': 1}),
+            wait=spec.Basic.ConsumeOk,
+            returns_tuple=True
+        )
+        assert self.c.callbacks[123] is callback
+        assert ret == 123
+
+    def test_basic_consume_no_wait(self):
+        callback = Mock()
+        ret_promise = promise()
+        self.c.send_method.return_value = ret_promise
+        ret = self.c.basic_consume(
+            'q', 123, arguments={'x': 1},
+            callback=callback, nowait=True
+        )
+        self.c.send_method.assert_called_with(
+            spec.Basic.Consume, 'BssbbbbF',
+            (0, 'q', 123, False, False, False, True, {'x': 1}),
+            wait=None,
+            returns_tuple=True
+        )
+        assert self.c.callbacks[123] is callback
+        assert ret == ret_promise
+
+    def test_basic_consume_no_wait_no_consumer_tag(self):
+        callback = Mock()
+        with pytest.raises(ValueError):
+            self.c.basic_consume(
+                'q', arguments={'x': 1},
+                callback=callback, nowait=True
+            )
+        assert 123 not in self.c.callbacks
+
     def test_on_basic_deliver(self):
-        msg = Mock()
+        msg = Message()
         self.c._on_basic_deliver(123, '321', False, 'ex', 'rkey', msg)
         callback = self.c.callbacks[123] = Mock(name='cb')
+
         self.c._on_basic_deliver(123, '321', False, 'ex', 'rkey', msg)
         callback.assert_called_with(msg)
+        assert msg.channel == self.c
+        assert msg.delivery_info == {
+            'consumer_tag': 123,
+            'delivery_tag': '321',
+            'redelivered': False,
+            'exchange': 'ex',
+            'routing_key': 'rkey',
+        }
 
     def test_basic_get(self):
         self.c._on_get_empty = Mock()
@@ -310,11 +371,19 @@ class test_Channel:
         self.c._on_get_empty(1)
 
     def test_on_get_ok(self):
-        msg = Mock()
+        msg = Message()
         m = self.c._on_get_ok(
             'dtag', 'redelivered', 'ex', 'rkey', 'mcount', msg,
         )
         assert m is msg
+        assert m.channel == self.c
+        assert m.delivery_info == {
+            'delivery_tag': 'dtag',
+            'redelivered': 'redelivered',
+            'exchange': 'ex',
+            'routing_key': 'rkey',
+            'message_count': 'mcount',
+        }
 
     def test_basic_publish(self):
         self.c.connection.transport.having_timeout = ContextMock()
@@ -334,8 +403,125 @@ class test_Channel:
         assert self.c._confirm_selected
         self.c._basic_publish.assert_called_with(1, 2, arg=1)
         assert ret is self.c._basic_publish()
-        self.c.wait.assert_called_with(spec.Basic.Ack)
+        self.c.wait.assert_called_with(
+            [spec.Basic.Ack, spec.Basic.Nack], callback=ANY
+        )
         self.c.basic_publish_confirm(1, 2, arg=1)
+
+    def test_basic_publish_confirm_nack(self):
+        # test checking whether library is handling correctly Nack confirms
+        # sent from RabbitMQ. Library must raise MessageNacked when server
+        # sent Nack message.
+
+        # Nack frame construction
+        args = dumps('Lb', (1, False))
+        frame = (b''.join([pack('>HH', *spec.Basic.Nack), args]))
+
+        def wait(method, *args, **kwargs):
+            # Simple mock simulating registering callbacks of real wait method
+            for m in method:
+                self.c._pending[m] = kwargs['callback']
+
+        self.c._basic_publish = Mock(name='_basic_publish')
+        self.c.wait = Mock(name='wait', side_effect=wait)
+
+        self.c.basic_publish_confirm(1, 2, arg=1)
+
+        with pytest.raises(MessageNacked):
+            # Inject Nack to message handler
+            self.c.dispatch_method(
+                spec.Basic.Nack, frame, None
+            )
+
+    def test_basic_publish_connection_blocked(self):
+        # Basic test checking that drain_events() is called
+        # before publishing message and send_method() is called
+        self.c._basic_publish('msg', 'ex', 'rkey')
+        self.conn.drain_events.assert_called_once_with(timeout=0)
+        self.c.send_method.assert_called_once_with(
+            spec.Basic.Publish, 'Bssbb',
+            (0, 'ex', 'rkey', False, False), 'msg',
+        )
+
+        self.c.send_method.reset_mock()
+
+        # Basic test checking that socket.timeout exception
+        # is ignored and send_method() is called.
+        self.conn.drain_events.side_effect = socket.timeout
+        self.c._basic_publish('msg', 'ex', 'rkey')
+        self.c.send_method.assert_called_once_with(
+            spec.Basic.Publish, 'Bssbb',
+            (0, 'ex', 'rkey', False, False), 'msg',
+        )
+
+    def test_basic_publish_connection_blocked_not_supported(self):
+        # Test veryfying that when server does not have
+        # connection.blocked capability, drain_events() are not called
+        self.conn.client_properties = {
+            'capabilities': {
+                'connection.blocked': False
+            }
+        }
+        self.c._basic_publish('msg', 'ex', 'rkey')
+        self.conn.drain_events.assert_not_called()
+        self.c.send_method.assert_called_once_with(
+            spec.Basic.Publish, 'Bssbb',
+            (0, 'ex', 'rkey', False, False), 'msg',
+        )
+
+    def test_basic_publish_connection_blocked_not_supported_missing(self):
+        # Test veryfying that when server does not have
+        # connection.blocked capability, drain_events() are not called
+        self.conn.client_properties = {
+            'capabilities': {}
+        }
+        self.c._basic_publish('msg', 'ex', 'rkey')
+        self.conn.drain_events.assert_not_called()
+        self.c.send_method.assert_called_once_with(
+            spec.Basic.Publish, 'Bssbb',
+            (0, 'ex', 'rkey', False, False), 'msg',
+        )
+
+    def test_basic_publish_connection_blocked_no_capabilities(self):
+        # Test veryfying that when server does not have
+        # support of capabilities, drain_events() are not called
+        self.conn.client_properties = {
+        }
+        self.c._basic_publish('msg', 'ex', 'rkey')
+        self.conn.drain_events.assert_not_called()
+        self.c.send_method.assert_called_once_with(
+            spec.Basic.Publish, 'Bssbb',
+            (0, 'ex', 'rkey', False, False), 'msg',
+        )
+
+    def test_basic_publish_confirm_callback(self):
+
+        def wait_nack(method, *args, **kwargs):
+            kwargs['callback'](spec.Basic.Nack)
+
+        def wait_ack(method, *args, **kwargs):
+            kwargs['callback'](spec.Basic.Ack)
+
+        self.c._basic_publish = Mock(name='_basic_publish')
+        self.c.wait = Mock(name='wait_nack', side_effect=wait_nack)
+
+        with pytest.raises(MessageNacked):
+            # when callback is called with spec.Basic.Nack it must raise
+            # MessageNacked exception
+            self.c.basic_publish_confirm(1, 2, arg=1)
+
+        self.c.wait = Mock(name='wait_ack', side_effect=wait_ack)
+
+        # when callback is called with spec.Basic.Ack
+        # it must nost raise exception
+        self.c.basic_publish_confirm(1, 2, arg=1)
+
+    def test_basic_publish_connection_closed(self):
+        self.c.collect()
+        with pytest.raises(RecoverableConnectionError) as excinfo:
+            self.c._basic_publish('msg', 'ex', 'rkey')
+        assert 'basic_publish: connection closed' in str(excinfo.value)
+        self.c.send_method.assert_not_called()
 
     def test_basic_qos(self):
         self.c.basic_qos(0, 123, False)
@@ -404,4 +590,10 @@ class test_Channel:
         callback = Mock(name='callback')
         self.c.events['basic_ack'].add(callback)
         self.c._on_basic_ack(123, True)
+        callback.assert_called_with(123, True)
+
+    def test_on_basic_nack(self):
+        callback = Mock(name='callback')
+        self.c.events['basic_nack'].add(callback)
+        self.c._on_basic_nack(123, True)
         callback.assert_called_with(123, True)
