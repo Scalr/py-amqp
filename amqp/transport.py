@@ -2,10 +2,12 @@
 # Copyright (C) 2009 Barry Pederson <bp@barryp.org>
 from __future__ import absolute_import, unicode_literals
 
+import os
 import errno
 import re
 import socket
 import ssl
+from ssl import SSLError
 from contextlib import contextmanager
 
 from .exceptions import UnexpectedFrame
@@ -13,11 +15,6 @@ from .five import items
 from .platform import KNOWN_TCP_OPTS, SOL_TCP, pack, unpack
 from .utils import get_errno, set_cloexec
 
-try:
-    from ssl import SSLError
-except ImportError:  # pragma: no cover
-    class SSLError(Exception):  # noqa
-        """Dummy SSL exception."""
 
 _UNAVAIL = {errno.EAGAIN, errno.EINTR, errno.ENOENT, errno.EWOULDBLOCK}
 
@@ -28,7 +25,7 @@ EMPTY_BUFFER = bytes()
 SIGNED_INT_MAX = 0x7FFFFFFF
 
 # Yes, Advanced Message Queuing Protocol Protocol is redundant
-AMQP_PROTOCOL_HEADER = 'AMQP\x01\x01\x00\x09'.encode('latin_1')
+AMQP_PROTOCOL_HEADER = 'AMQP\x00\x00\x09\x01'.encode('latin_1')
 
 # Match things like: [fe80::1]:5432, from RFC 2732
 IPV6_LITERAL = re.compile(r'\[([\.0-9a-f:]+)\](?::(\d+))?')
@@ -60,12 +57,10 @@ def to_host_port(host, default=AMQP_PORT):
 class _AbstractTransport(object):
     """Common superclass for TCP and SSL transports."""
 
-    connected = False
-
     def __init__(self, host, connect_timeout=None,
                  read_timeout=None, write_timeout=None,
                  socket_settings=None, raise_on_initial_eintr=True, **kwargs):
-        self.connected = True
+        self.connected = False
         self.sock = None
         self.raise_on_initial_eintr = raise_on_initial_eintr
         self._read_buffer = EMPTY_BUFFER
@@ -76,10 +71,24 @@ class _AbstractTransport(object):
         self.socket_settings = socket_settings
 
     def connect(self):
-        self._connect(self.host, self.port, self.connect_timeout)
-        self._init_socket(
-            self.socket_settings, self.read_timeout, self.write_timeout,
-        )
+        try:
+            # are we already connected?
+            if self.connected:
+                return
+            self._connect(self.host, self.port, self.connect_timeout)
+            self._init_socket(
+                self.socket_settings, self.read_timeout, self.write_timeout,
+            )
+            # we've sent the banner; signal connect
+            # EINTR, EAGAIN, EWOULDBLOCK would signal that the banner
+            # has _not_ been sent
+            self.connected = True
+        except (OSError, IOError, SSLError):
+            # if not fully connected, close socket, and reraise error
+            if self.sock and not self.connected:
+                self.sock.close()
+                self.sock = None
+            raise
 
     @contextmanager
     def having_timeout(self, timeout):
@@ -98,6 +107,10 @@ class _AbstractTransport(object):
                     raise socket.timeout()
                 elif 'The operation did not complete' in str(exc):
                     # Non-blocking SSL sockets can throw SSLError
+                    raise socket.timeout()
+                raise
+            except socket.error as exc:
+                if get_errno(exc) == errno.EWOULDBLOCK:
                     raise socket.timeout()
                 raise
             finally:
@@ -160,26 +173,23 @@ class _AbstractTransport(object):
                     return
 
     def _init_socket(self, socket_settings, read_timeout, write_timeout):
-        try:
-            self.sock.settimeout(None)  # set socket back to blocking mode
-            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            self._set_socket_options(socket_settings)
+        self.sock.settimeout(None)  # set socket back to blocking mode
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        self._set_socket_options(socket_settings)
 
-            # set socket timeouts
-            for timeout, interval in ((socket.SO_SNDTIMEO, write_timeout),
-                                      (socket.SO_RCVTIMEO, read_timeout)):
-                if interval is not None:
-                    self.sock.setsockopt(
-                        socket.SOL_SOCKET, timeout,
-                        pack('ll', interval, 0),
-                    )
-            self._setup_transport()
+        # set socket timeouts
+        for timeout, interval in ((socket.SO_SNDTIMEO, write_timeout),
+                                  (socket.SO_RCVTIMEO, read_timeout)):
+            if interval is not None:
+                sec = int(interval)
+                usec = int((interval - sec) * 1000000)
+                self.sock.setsockopt(
+                    socket.SOL_SOCKET, timeout,
+                    pack('ll', sec, usec),
+                )
+        self._setup_transport()
 
-            self._write(AMQP_PROTOCOL_HEADER)
-        except (OSError, IOError, socket.error) as exc:
-            if get_errno(exc) not in _UNAVAIL:
-                self.connected = False
-            raise
+        self._write(AMQP_PROTOCOL_HEADER)
 
     def _get_tcp_socket_defaults(self, sock):
         tcp_opts = {}
@@ -252,8 +262,16 @@ class _AbstractTransport(object):
             # so we know the size can be at most 2 * SIGNED_INT_MAX
             if size > SIGNED_INT_MAX:
                 part1 = read(SIGNED_INT_MAX)
-                part2 = read(size - SIGNED_INT_MAX)
-                payload = ''.join([part1, part2])
+
+                try:
+                    part2 = read(size - SIGNED_INT_MAX)
+                except (socket.timeout, socket.error, SSLError):
+                    # In case this read times out, we need to make sure to not
+                    # lose part1 when we retry the read
+                    read_frame_buffer += part1
+                    raise
+
+                payload = b''.join([part1, part2])
             else:
                 payload = read(size)
             read_frame_buffer += payload
@@ -262,10 +280,22 @@ class _AbstractTransport(object):
             self._read_buffer = read_frame_buffer + self._read_buffer
             raise
         except (OSError, IOError, SSLError, socket.error) as exc:
-            # Don't disconnect for ssl read time outs
-            # http://bugs.python.org/issue10272
-            if isinstance(exc, SSLError) and 'timed out' in str(exc):
+            if (
+                isinstance(exc, socket.error) and os.name == 'nt'
+                and get_errno(exc) == errno.EWOULDBLOCK  # noqa
+            ):
+                # On windows we can get a read timeout with a winsock error
+                # code instead of a proper socket.timeout() error, see
+                # https://github.com/celery/py-amqp/issues/320
+                self._read_buffer = read_frame_buffer + self._read_buffer
                 raise socket.timeout()
+
+            if isinstance(exc, SSLError) and 'timed out' in str(exc):
+                # Don't disconnect for ssl read time outs
+                # http://bugs.python.org/issue10272
+                self._read_buffer = read_frame_buffer + self._read_buffer
+                raise socket.timeout()
+
             if get_errno(exc) not in _UNAVAIL:
                 self.connected = False
             raise
@@ -313,7 +343,7 @@ class SSLTransport(_AbstractTransport):
 
     def _wrap_socket_sni(self, sock, keyfile=None, certfile=None,
                          server_side=False, cert_reqs=ssl.CERT_NONE,
-                         ca_certs=None, do_handshake_on_connect=True,
+                         ca_certs=None, do_handshake_on_connect=False,
                          suppress_ragged_eofs=True, server_hostname=None,
                          ciphers=None, ssl_version=None):
         """Socket wrap with SNI headers.
@@ -321,39 +351,49 @@ class SSLTransport(_AbstractTransport):
         Default `ssl.wrap_socket` method augmented with support for
         setting the server_hostname field required for SNI hostname header
         """
-        opts = dict(sock=sock, keyfile=keyfile, certfile=certfile,
-                    server_side=server_side, cert_reqs=cert_reqs,
-                    ca_certs=ca_certs,
-                    do_handshake_on_connect=do_handshake_on_connect,
-                    suppress_ragged_eofs=suppress_ragged_eofs,
-                    ciphers=ciphers)
         # Setup the right SSL version; default to optimal versions across
         # ssl implementations
-        if ssl_version is not None:
-            opts['ssl_version'] = ssl_version
-        else:
+        if ssl_version is None:
             # older versions of python 2.7 and python 2.6 do not have the
             # ssl.PROTOCOL_TLS defined the equivalent is ssl.PROTOCOL_SSLv23
             # we default to PROTOCOL_TLS and fallback to PROTOCOL_SSLv23
+            # TODO: Drop this once we drop Python 2.7 support
             if hasattr(ssl, 'PROTOCOL_TLS'):
-                opts['ssl_version'] = ssl.PROTOCOL_TLS
+                ssl_version = ssl.PROTOCOL_TLS
             else:
-                opts['ssl_version'] = ssl.PROTOCOL_SSLv23
+                ssl_version = ssl.PROTOCOL_SSLv23
+
+        opts = {
+            'sock': sock,
+            'keyfile': keyfile,
+            'certfile': certfile,
+            'server_side': server_side,
+            'cert_reqs': cert_reqs,
+            'ca_certs': ca_certs,
+            'do_handshake_on_connect': do_handshake_on_connect,
+            'suppress_ragged_eofs': suppress_ragged_eofs,
+            'ciphers': ciphers,
+            'ssl_version': ssl_version
+        }
+
+        sock = ssl.wrap_socket(**opts)
         # Set SNI headers if supported
         if (server_hostname is not None) and (
-                hasattr(ssl, 'HAS_SNI') and ssl.HAS_SNI):
-            opts['server_hostname'] = server_hostname
-        sock = ssl.SSLSocket(**opts)
+                hasattr(ssl, 'HAS_SNI') and ssl.HAS_SNI) and (
+                hasattr(ssl, 'SSLContext')):
+            context = ssl.SSLContext(opts['ssl_version'])
+            context.verify_mode = cert_reqs
+            if cert_reqs != ssl.CERT_NONE:
+                context.check_hostname = True
+            if (certfile is not None) and (keyfile is not None):
+                context.load_cert_chain(certfile, keyfile)
+            sock = context.wrap_socket(sock, server_hostname=server_hostname)
         return sock
 
     def _shutdown_transport(self):
-        """Unwrap a Python 2.6 SSL socket, so we can call shutdown()."""
+        """Unwrap a SSL socket, so we can call shutdown()."""
         if self.sock is not None:
-            try:
-                unwrap = self.sock.unwrap
-            except AttributeError:
-                return
-            self.sock = unwrap()
+            self.sock = self.sock.unwrap()
 
     def _read(self, n, initial=False,
               _errnos=(errno.ENOENT, errno.EAGAIN, errno.EINTR)):
@@ -367,6 +407,10 @@ class SSLTransport(_AbstractTransport):
                 try:
                     s = recv(n - len(rbuf))  # see note above
                 except socket.error as exc:
+                    # ssl.sock.read may cause a SSLerror without errno
+                    # http://bugs.python.org/issue10272
+                    if isinstance(exc, SSLError) and 'timed out' in str(exc):
+                        raise socket.timeout()
                     # ssl.sock.read may cause ENOENT if the
                     # operation couldn't be performed (Issue celery#1414).
                     if exc.errno in _errnos:
@@ -375,7 +419,7 @@ class SSLTransport(_AbstractTransport):
                         continue
                     raise
                 if not s:
-                    raise IOError('Socket closed')
+                    raise IOError('Server unexpectedly closed connection')
                 rbuf += s
         except:  # noqa
             self._read_buffer = rbuf
@@ -389,14 +433,11 @@ class SSLTransport(_AbstractTransport):
         while s:
             try:
                 n = write(s)
-            except (ValueError, AttributeError):
+            except ValueError:
                 # AG: sock._sslobj might become null in the meantime if the
                 # remote connection has hung up.
-                # In python 3.2, an AttributeError is raised because the SSL
-                # module tries to access self._sslobj.write (w/ self._sslobj ==
-                # None)
                 # In python 3.4, a ValueError is raised is self._sslobj is
-                # None. So much for portability... :/
+                # None.
                 n = 0
             if not n:
                 raise IOError('Socket closed')
@@ -428,7 +469,7 @@ class TCPTransport(_AbstractTransport):
                         continue
                     raise
                 if not s:
-                    raise IOError('Socket closed')
+                    raise IOError('Server unexpectedly closed connection')
                 rbuf += s
         except:  # noqa
             self._read_buffer = rbuf

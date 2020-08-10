@@ -2,14 +2,22 @@ from __future__ import absolute_import, unicode_literals
 
 import errno
 import socket
+import struct
+import os
 
 import pytest
-from case import ANY, Mock, call, patch
 
 from amqp import transport
 from amqp.exceptions import UnexpectedFrame
 from amqp.platform import pack
 from amqp.transport import _AbstractTransport
+from case import ANY, MagicMock, Mock, call, patch
+
+SIGNED_INT_MAX = 0x7FFFFFFF
+
+
+class DummyException(Exception):
+    pass
 
 
 class MockSocket(object):
@@ -21,7 +29,10 @@ class MockSocket(object):
         self.sa = None
 
     def setsockopt(self, family, key, value):
-        if not isinstance(value, int):
+        if (family == socket.SOL_SOCKET and
+                key in (socket.SO_RCVTIMEO, socket.SO_SNDTIMEO)):
+            self.options[key] = value
+        elif not isinstance(value, int):
             raise socket.error()
         self.options[key] = value
 
@@ -202,6 +213,27 @@ class test_socket_options:
 
         assert opts
 
+    def test_set_sockopt_opts_timeout(self):
+        # tests socket options SO_RCVTIMEO and SO_SNDTIMEO
+        self.transp = transport.Transport(
+            self.host, self.connect_timeout,
+        )
+        read_timeout_sec, read_timeout_usec = 0xdead, 0xbeef
+        write_timeout_sec = 0x42
+
+        self.transp.read_timeout = read_timeout_sec + \
+            read_timeout_usec * 0.000001
+        self.transp.write_timeout = write_timeout_sec
+        self.transp.connect()
+
+        expected_rcvtimeo = struct.pack('ll', read_timeout_sec,
+                                        read_timeout_usec)
+        expected_sndtimeo = struct.pack('ll', write_timeout_sec, 0)
+        assert expected_rcvtimeo == self.socket.getsockopt(socket.SOL_TCP,
+                                                           socket.SO_RCVTIMEO)
+        assert expected_sndtimeo == self.socket.getsockopt(socket.SOL_TCP,
+                                                           socket.SO_SNDTIMEO)
+
 
 class test_AbstractTransport:
 
@@ -242,8 +274,9 @@ class test_AbstractTransport:
         self.t.close()
         sock.shutdown.assert_called_with(socket.SHUT_RDWR)
         sock.close.assert_called_with()
-        assert self.t.sock is None
+        assert self.t.sock is None and self.t.connected is False
         self.t.close()
+        assert self.t.sock is None and self.t.connected is False
 
     def test_read_frame__timeout(self):
         self.t._read = Mock()
@@ -299,6 +332,28 @@ class test_AbstractTransport:
         with pytest.raises(UnexpectedFrame):
             self.t.read_frame()
 
+    def test_read_frame__long(self):
+        self.t._read = Mock()
+        self.t._read.side_effect = [pack('>BHI', 1, 1, SIGNED_INT_MAX + 16),
+                                    b'read1', b'read2', b'\xce']
+        frame_type, channel, payload = self.t.read_frame()
+        assert frame_type == 1
+        assert channel == 1
+        assert payload == b'read1read2'
+
+    def transport_read_EOF(self):
+        for host, ssl in (('localhost:5672', False),
+                          ('localhost:5671', True),):
+            self.t = transport.Transport(host, ssl)
+            self.t.sock = Mock(name='socket')
+            self.t.connected = True
+            self.t._quick_recv = Mock(name='recv', return_value='')
+            with pytest.raises(
+                IOError,
+                match=r'.*Server unexpectedly closed connection.*'
+            ):
+                self.t.read_frame()
+
     def test_write__success(self):
         self.t._write = Mock()
         self.t.write('foo')
@@ -325,8 +380,68 @@ class test_AbstractTransport:
         assert not self.t.connected
 
     def test_having_timeout_none(self):
+        # Checks that context manager does nothing when no timeout is provided
         with self.t.having_timeout(None) as actual_sock:
             assert actual_sock == self.t.sock
+
+    def test_set_timeout(self):
+        # Checks that context manager sets and reverts timeout properly
+        with patch.object(self.t, 'sock') as sock_mock:
+            sock_mock.gettimeout.return_value = 3
+            with self.t.having_timeout(5) as actual_sock:
+                assert actual_sock == self.t.sock
+            sock_mock.gettimeout.assert_called()
+            sock_mock.settimeout.assert_has_calls(
+                [
+                    call(5),
+                    call(3),
+                ]
+            )
+
+    def test_set_timeout_exception_raised(self):
+        # Checks that context manager sets and reverts timeout properly
+        # when exception is raised.
+        with patch.object(self.t, 'sock') as sock_mock:
+            sock_mock.gettimeout.return_value = 3
+            with pytest.raises(DummyException):
+                with self.t.having_timeout(5) as actual_sock:
+                    assert actual_sock == self.t.sock
+                    raise DummyException()
+            sock_mock.gettimeout.assert_called()
+            sock_mock.settimeout.assert_has_calls(
+                [
+                    call(5),
+                    call(3),
+                ]
+            )
+
+    def test_set_same_timeout(self):
+        # Checks that context manager does not set timeout when
+        # it is same as currently set.
+        with patch.object(self.t, 'sock') as sock_mock:
+            sock_mock.gettimeout.return_value = 5
+            with self.t.having_timeout(5) as actual_sock:
+                assert actual_sock == self.t.sock
+            sock_mock.gettimeout.assert_called()
+            sock_mock.settimeout.assert_not_called()
+
+    def test_set_timeout_ewouldblock_exc(self):
+        # We expect EWOULDBLOCK to be handled as a timeout.
+        with patch.object(self.t, 'sock') as sock_mock:
+            sock_mock.gettimeout.return_value = 3
+            with pytest.raises(socket.timeout):
+                with self.t.having_timeout(5):
+                    err = socket.error()
+                    err.errno = errno.EWOULDBLOCK
+                    raise err
+
+            class DummySocketError(socket.error):
+                pass
+
+            # Other socket errors shouldn't be converted.
+            with pytest.raises(DummySocketError):
+                with self.t.having_timeout(5):
+                    raise DummySocketError()
 
 
 class test_AbstractTransport_connect:
@@ -350,6 +465,7 @@ class test_AbstractTransport_connect:
         with patch('socket.socket', side_effect=socket.error):
             with pytest.raises(socket.error):
                 self.t.connect()
+        assert self.t.sock is None and self.t.connected is False
 
     def test_connect_socket_initialization_fails(self):
         with patch('socket.socket', side_effect=socket.error), \
@@ -362,6 +478,7 @@ class test_AbstractTransport_connect:
                   ]):
             with pytest.raises(socket.error):
                 self.t.connect()
+            assert self.t.sock is None and self.t.connected is False
 
     def test_connect_multiple_addr_entries_fails(self):
         with patch('socket.socket', return_value=MockSocket()) as sock_mock, \
@@ -452,6 +569,15 @@ class test_AbstractTransport_connect:
                 self.t.connect()
             assert cloexec_mock.called
 
+    def test_connect_already_connected(self):
+        assert not self.t.connected
+        with patch('socket.socket', return_value=MockSocket()):
+            self.t.connect()
+        assert self.t.connected
+        sock_obj = self.t.sock
+        self.t.connect()
+        assert self.t.connected and self.t.sock is sock_obj
+
 
 class test_SSLTransport:
 
@@ -497,14 +623,69 @@ class test_SSLTransport:
             assert ctx.check_hostname
             ctx.wrap_socket.assert_called_with(sock, f=1)
 
+    def test_wrap_socket_sni(self):
+        sock = Mock()
+        with patch('ssl.wrap_socket') as mock_ssl_wrap:
+            self.t._wrap_socket_sni(sock)
+            mock_ssl_wrap.assert_called_with(cert_reqs=0, certfile=None,
+                                             keyfile=None, sock=sock,
+                                             ca_certs=None, server_side=False,
+                                             ciphers=None, ssl_version=2,
+                                             suppress_ragged_eofs=True,
+                                             do_handshake_on_connect=False)
+
     def test_shutdown_transport(self):
         self.t.sock = None
         self.t._shutdown_transport()
-        self.t.sock = object()
-        self.t._shutdown_transport()
+
         sock = self.t.sock = Mock()
         self.t._shutdown_transport()
         assert self.t.sock is sock.unwrap()
+
+    def test_read_EOF(self):
+        self.t.sock = Mock(name='SSLSocket')
+        self.t.connected = True
+        self.t._quick_recv = Mock(name='recv', return_value='')
+        with pytest.raises(IOError,
+                           match=r'.*Server unexpectedly closed connection.*'):
+            self.t._read(64)
+
+    def test_write_success(self):
+        self.t.sock = Mock(name='SSLSocket')
+        self.t.sock.write.return_value = 2
+        self.t._write('foo')
+        self.t.sock.write.assert_called()
+
+    def test_write_socket_closed(self):
+        self.t.sock = Mock(name='SSLSocket')
+        self.t.sock.write.return_value = ''
+        with pytest.raises(IOError,
+                           match=r'.*Socket closed.*'):
+            self.t._write('foo')
+
+    def test_write_ValueError(self):
+        self.t.sock = Mock(name='SSLSocket')
+        self.t.sock.write.return_value = 2
+        self.t.sock.write.side_effect = ValueError("Some error")
+        with pytest.raises(IOError,
+                           match=r'.*Socket closed.*'):
+            self.t._write('foo')
+
+    def test_read_timeout(self):
+        self.t.sock = Mock(name='SSLSocket')
+        self.t._quick_recv = Mock(name='recv', return_value='4')
+        self.t._quick_recv.side_effect = socket.timeout()
+        self.t._read_buffer = MagicMock(return_value='AA')
+        with pytest.raises(socket.timeout):
+            self.t._read(64)
+
+    def test_read_SSLError(self):
+        self.t.sock = Mock(name='SSLSocket')
+        self.t._quick_recv = Mock(name='recv', return_value='4')
+        self.t._quick_recv.side_effect = transport.SSLError('timed out')
+        self.t._read_buffer = MagicMock(return_value='AA')
+        with pytest.raises(socket.timeout):
+            self.t._read(64)
 
 
 class test_TCPTransport:
@@ -527,3 +708,47 @@ class test_TCPTransport:
         assert self.t._write is self.t.sock.sendall
         assert self.t._read_buffer is not None
         assert self.t._quick_recv is self.t.sock.recv
+
+    def test_read_EOF(self):
+        self.t.sock = Mock(name='socket')
+        self.t.connected = True
+        self.t._quick_recv = Mock(name='recv', return_value='')
+        with pytest.raises(IOError,
+                           match=r'.*Server unexpectedly closed connection.*'):
+            self.t._read(64)
+
+    def test_read_frame__windowstimeout(self, monkeypatch):
+        """Make sure BlockingIOError on Windows properly saves off partial reads.
+
+        See https://github.com/celery/py-amqp/issues/320
+        """
+
+        self.t._quick_recv = Mock()
+
+        self.t._quick_recv.side_effect = [
+            pack('>BHI', 1, 1, 16),
+            socket.error(
+                10035,
+                "A non-blocking socket operation could "
+                "not be completed immediately"
+            ),
+            b'thequickbrownfox',
+            b'\xce'
+        ]
+
+        monkeypatch.setattr(os, 'name', 'nt')
+        monkeypatch.setattr(errno, 'EWOULDBLOCK', 10035)
+
+        assert len(self.t._read_buffer) == 0
+
+        with pytest.raises(socket.timeout):
+            self.t.read_frame()
+
+        assert len(self.t._read_buffer) == 7
+
+        frame_type, channel, payload = self.t.read_frame()
+
+        assert len(self.t._read_buffer) == 0
+        assert frame_type == 1
+        assert channel == 1
+        assert payload == b'thequickbrownfox'

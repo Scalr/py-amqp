@@ -34,7 +34,7 @@ ILLEGAL_TABLE_TYPE_WITH_VALUE = """\
 """
 
 
-def _read_item(buf, offset=0, unpack_from=unpack_from, ftype_t=ftype_t):
+def _read_item(buf, offset):
     ftype = ftype_t(buf[offset]) if ftype_t else buf[offset]
     offset += 1
 
@@ -42,7 +42,11 @@ def _read_item(buf, offset=0, unpack_from=unpack_from, ftype_t=ftype_t):
     if ftype == 'S':
         slen, = unpack_from('>I', buf, offset)
         offset += 4
-        val = pstr_t(buf[offset:offset + slen])
+        try:
+            val = pstr_t(buf[offset:offset + slen])
+        except UnicodeDecodeError:
+            val = buf[offset:offset + slen]
+
         offset += slen
     # 's': short string
     elif ftype == 's':
@@ -50,6 +54,12 @@ def _read_item(buf, offset=0, unpack_from=unpack_from, ftype_t=ftype_t):
         offset += 1
         val = pstr_t(buf[offset:offset + slen])
         offset += slen
+    # 'x': Bytes Array
+    elif ftype == 'x':
+        blen, = unpack_from('>I', buf, offset)
+        offset += 4
+        val = buf[offset:offset + blen]
+        offset += blen
     # 'b': short-short int
     elif ftype == 'b':
         val, = unpack_from('>B', buf, offset)
@@ -138,9 +148,7 @@ def _read_item(buf, offset=0, unpack_from=unpack_from, ftype_t=ftype_t):
     return val, offset
 
 
-def loads(format, buf, offset=0,
-          ord=ord, unpack_from=unpack_from,
-          _read_item=_read_item, pstr_t=pstr_t):
+def loads(format, buf, offset):
     """Deserialize amqp format.
 
     bit = b
@@ -165,11 +173,11 @@ def loads(format, buf, offset=0,
         if p == 'b':
             if not bitcount:
                 bits = ord(buf[offset:offset + 1])
-            bitcount = 8
+                offset += 1
+                bitcount = 8
             val = (bits & 1) == 1
             bits >>= 1
             bitcount -= 1
-            offset += 1
         elif p == 'o':
             bitcount = bits = 0
             val, = unpack_from('>B', buf, offset)
@@ -202,6 +210,11 @@ def loads(format, buf, offset=0,
             offset += 4
             val = buf[offset:offset + slen].decode('utf-8', 'surrogatepass')
             offset += slen
+        elif p == 'x':
+            blen, = unpack_from('>I', buf, offset)
+            offset += 4
+            val = buf[offset:offset + blen]
+            offset += blen
         elif p == 'F':
             bitcount = bits = 0
             tlen, = unpack_from('>I', buf, offset)
@@ -234,7 +247,7 @@ def loads(format, buf, offset=0,
     return values, offset
 
 
-def _flushbits(bits, write, pack=pack):
+def _flushbits(bits, write):
     if bits:
         write(pack('B' * len(bits), *bits))
         bits[:] = []
@@ -252,6 +265,7 @@ def dumps(format, values):
         long long = L
         shortstr = s
         longstr = S
+        byte array = x
         table = F
         array = A
     """
@@ -293,7 +307,7 @@ def dumps(format, values):
                 val = val.encode('utf-8', 'surrogatepass')
             write(pack('B', len(val)))
             write(val)
-        elif p == 'S':
+        elif p == 'S' or p == 'x':
             val = val or ''
             bitcount = _flushbits(bits, write)
             if isinstance(val, string):
@@ -313,7 +327,7 @@ def dumps(format, values):
     return out.getvalue()
 
 
-def _write_table(d, write, bits, pack=pack):
+def _write_table(d, write, bits):
     out = BytesIO()
     twrite = out.write
     for k, v in items(d):
@@ -331,7 +345,7 @@ def _write_table(d, write, bits, pack=pack):
     write(table_data)
 
 
-def _write_array(l, write, bits, pack=pack):
+def _write_array(l, write, bits):
     out = BytesIO()
     awrite = out.write
     for v in l:
@@ -345,11 +359,7 @@ def _write_array(l, write, bits, pack=pack):
     write(array_data)
 
 
-def _write_item(v, write, bits, pack=pack,
-                string_t=string_t, bytes=bytes, string=string, bool=bool,
-                float=float, int_types=int_types, Decimal=Decimal,
-                datetime=datetime, dict=dict, list=list, tuple=tuple,
-                None_t=None):
+def _write_item(v, write, bits):
     if isinstance(v, (string_t, bytes)):
         if isinstance(v, string):
             v = v.encode('utf-8', 'surrogatepass')
@@ -381,14 +391,13 @@ def _write_item(v, write, bits, pack=pack,
     elif isinstance(v, (list, tuple)):
         write(b'A')
         _write_array(v, write, bits)
-    elif v is None_t:
+    elif v is None:
         write(b'V')
     else:
         raise ValueError()
 
 
-def decode_properties_basic(buf, offset=0,
-                            unpack_from=unpack_from, pstr_t=pstr_t):
+def decode_properties_basic(buf, offset):
     """Decode basic properties."""
     properties = {}
 
@@ -495,8 +504,7 @@ class GenericContent(object):
             return self.properties[name]
         raise AttributeError(name)
 
-    def _load_properties(self, class_id, buf, offset=0,
-                         classes=PROPERTY_CLASSES, unpack_from=unpack_from):
+    def _load_properties(self, class_id, buf, offset):
         """Load AMQP properties.
 
         Given the raw bytes containing the property-flags and property-list
@@ -504,7 +512,7 @@ class GenericContent(object):
         stored in this object as an attribute named 'properties'.
         """
         # Read 16-bit shorts until we get one with a low bit set to zero
-        props, offset = classes[class_id](buf, offset)
+        props, offset = PROPERTY_CLASSES[class_id](buf, offset)
         self.properties = props
         return offset
 
@@ -520,7 +528,6 @@ class GenericContent(object):
         flags = []
         sformat, svalues = [], []
         props = self.properties
-        props.setdefault('content_encoding', 'utf-8')
         for key, proptype in self.PROPERTIES:
             val = props.get(key, None)
             if val is not None:
